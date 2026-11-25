@@ -1,6 +1,5 @@
 package ru.practicum.moviehub.http;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
@@ -20,43 +19,32 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class MoviesHandler extends BaseHttpHandler {
-    private static final String MOVIES_PATH = "/movies";
-    private static final String MOVIE_PATH_PREFIX = MOVIES_PATH + "/";
+    static final String MOVIES_PATH = "/movies";
     private static final int MIN_YEAR = 1888;
     private static final int MAX_TITLE_LENGTH = 100;
 
     private final MoviesStore store;
-    private final Gson gson = new Gson();
 
     public MoviesHandler(MoviesStore store) {
         this.store = store;
     }
 
     @Override
-    public void handle(HttpExchange exchange) throws IOException {
-        try {
-            // Проверяем весь путь: /moviesExtra не должен попадать в список фильмов.
-            String path = exchange.getRequestURI().getPath();
-            if (path.equals(MOVIES_PATH)) {
-                switch (exchange.getRequestMethod()) {
-                    case "GET":
-                        getMovies(exchange);
-                        break;
-                    case "POST":
-                        addMovie(exchange);
-                        break;
-                    default:
-                        sendMethodNotAllowed(exchange, "GET, POST");
-                }
-            } else if (path.startsWith(MOVIE_PATH_PREFIX) && path.length() > MOVIE_PATH_PREFIX.length()
-                    && !path.substring(MOVIE_PATH_PREFIX.length()).contains("/")) {
-                handleMovie(exchange, path.substring(MOVIE_PATH_PREFIX.length()));
-            } else {
-                sendError(exchange, 404, "Путь не найден");
-            }
-        } finally {
-            // Закрываем обмен даже при ошибке во время обработки запроса как и было в практике к этому финальному заданию
-            exchange.close();
+    protected void handleRequest(HttpExchange exchange) throws IOException {
+        // HttpServer выбирает контекст по префиксу, поэтому /moviesExtra тоже нужно проверить.
+        if (!MOVIES_PATH.equals(exchange.getRequestURI().getPath())) {
+            sendError(exchange, 404, "Путь не найден");
+            return;
+        }
+        switch (exchange.getRequestMethod()) {
+            case "GET":
+                getMovies(exchange);
+                break;
+            case "POST":
+                addMovie(exchange);
+                break;
+            default:
+                sendMethodNotAllowed(exchange, "GET, POST");
         }
     }
 
@@ -107,30 +95,39 @@ public class MoviesHandler extends BaseHttpHandler {
             sendError(exchange, 400, "Некорректный JSON");
             return;
         }
-        // собираем все ошибки полей чтобы клиент мог исправить их за один запрос
-        List<String> details = new ArrayList<>();
-        JsonElement titleValue = json.get("title");
-        String title = null;
-        // проверяем тип до getAsString иначе Gson может превратить число в строку
-        if (titleValue != null && titleValue.isJsonPrimitive() && titleValue.getAsJsonPrimitive().isString()) {
-            title = titleValue.getAsString();
-        }
-        if (title == null || title.isBlank()) {
-            details.add("название не должно быть пустым и должно быть строкой");
-        } else if (title.length() > MAX_TITLE_LENGTH) {
-            details.add("название должно содержать не более 100 символов");
-        }
+        String title = readTitle(json);
         Integer year = readYear(json.get("year"));
-        if (year == null || !isValidYear(year)) {
-            details.add("год должен быть целым числом между 1888 и " + (Year.now().getValue() + 1));
-        }
+        List<String> details = validateMovie(title, year);
         if (!details.isEmpty()) {
             sendResponse(exchange, 422, new ErrorResponse("Ошибка валидации", details));
             return;
         }
         Movie movie = store.add(title, year);
-        exchange.getResponseHeaders().set("Location", "/movies/" + movie.getId());
+        exchange.getResponseHeaders().set("Location", MovieByIdHandler.MOVIE_PATH_PREFIX + movie.getId());
         sendResponse(exchange, 201, movie);
+    }
+
+    private List<String> validateMovie(String title, Integer year) {
+        // Собираем все ошибки, чтобы клиент мог исправить поля за один запрос.
+        List<String> details = new ArrayList<>();
+        if (title == null || title.isBlank()) {
+            details.add("название не должно быть пустым и должно быть строкой");
+        } else if (title.length() > MAX_TITLE_LENGTH) {
+            details.add("название должно содержать не более 100 символов");
+        }
+        if (year == null || !isValidYear(year)) {
+            details.add("год должен быть целым числом между 1888 и " + (Year.now().getValue() + 1));
+        }
+        return details;
+    }
+
+    private String readTitle(JsonObject json) {
+        JsonElement titleValue = json.get("title");
+        // проверяем тип до getAsString иначе Gson может превратить число в строку
+        if (titleValue != null && titleValue.isJsonPrimitive() && titleValue.getAsJsonPrimitive().isString()) {
+            return titleValue.getAsString();
+        }
+        return null;
     }
 
     private Integer readYear(JsonElement value) {
@@ -147,46 +144,5 @@ public class MoviesHandler extends BaseHttpHandler {
 
     private boolean isValidYear(int year) {
         return year >= MIN_YEAR && year <= Year.now().getValue() + 1;
-    }
-
-    private void handleMovie(HttpExchange exchange, String rawId) throws IOException {
-        String method = exchange.getRequestMethod();
-        // сначала проверяем метод чтобы неподдерживаемый запрос получил 405
-        if (!method.equals("GET") && !method.equals("DELETE")) {
-            sendMethodNotAllowed(exchange, "GET, DELETE");
-            return;
-        }
-        int id;
-        try {
-            id = Integer.parseInt(rawId);
-        } catch (NumberFormatException e) {
-            sendError(exchange, 400, "Некорректный ID");
-            return;
-        }
-        if (method.equals("GET")) {
-            Movie movie = store.findById(id);
-            if (movie == null) {
-                sendError(exchange, 404, "Фильм не найден");
-            } else {
-                sendResponse(exchange, 200, movie);
-            }
-        } else if (store.delete(id)) {
-            sendNoContent(exchange);
-        } else {
-            sendError(exchange, 404, "Фильм не найден");
-        }
-    }
-
-    private void sendMethodNotAllowed(HttpExchange exchange, String allow) throws IOException {
-        exchange.getResponseHeaders().set("Allow", allow);
-        sendError(exchange, 405, "Метод не поддерживается");
-    }
-
-    private void sendError(HttpExchange exchange, int status, String message) throws IOException {
-        sendResponse(exchange, status, new ErrorResponse(message));
-    }
-
-    private void sendResponse(HttpExchange exchange, int status, Object value) throws IOException {
-        sendJson(exchange, status, gson.toJson(value));
     }
 }
